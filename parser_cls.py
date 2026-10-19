@@ -1,0 +1,505 @@
+import json
+import random
+import re
+import time
+from datetime import datetime, timedelta
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+from bs4 import BeautifulSoup
+from loguru import logger
+from pydantic import ValidationError
+
+from common_data import HEADERS
+from db_service import SQLiteDBHandler
+from dto import Proxy, AvitoConfig
+from filters.ads_filter import AdsFilter
+from hide_private_data import log_config
+from integrations.notifications.factory import build_notifier
+from load_config import load_avito_config
+from models import ItemsResponse, Item
+from parser.cookies.factory import build_cookies_provider
+from parser.export.factory import build_result_storage
+from parser.http.client import HttpClient
+from parser.proxies.proxy_factory import build_proxy
+from parser.url_converter import AvitoUrlConverter
+from utils.parse_phone import ParsePhone
+from utils.log_cleanup import clean_old_logs
+from version import VERSION
+from lang import SPFA_PROXY_REQUIRED
+
+# Очистка устаревших логов перед добавлением хендлера (Issue #274)
+clean_old_logs("logs", max_age_days=5, max_files=10)
+logger.add("logs/app.log", rotation="5 MB", retention="5 days", compression="zip", level="DEBUG")
+
+
+class AvitoParse:
+    def __init__(
+            self,
+            config: AvitoConfig,
+            stop_event=None
+    ):
+        self.config = config
+        retention_days = getattr(self.config, "log_retention_days", 5)
+        max_files = getattr(self.config, "log_max_files", 10)
+        clean_old_logs("logs", max_age_days=retention_days, max_files=max_files)
+
+        self.proxy = build_proxy(self.config)
+        self.cookies_provider = build_cookies_provider(config=config, proxy=self.proxy)
+        self.db_handler = SQLiteDBHandler()
+        self.notifier = build_notifier(config=config)
+        self.result_storage = None
+        self.url_converter = AvitoUrlConverter()
+        self.stop_event = stop_event
+        self.headers = HEADERS
+        self.good_request_count = 0
+        self.bad_request_count = 0
+        self.http = HttpClient(
+            proxy=self.proxy,
+            cookies=self.cookies_provider,
+            timeout=config.timeout,
+            max_retries=self.config.max_count_of_retry,
+            retry_delay=config.retry_delay,
+            block_threshold=config.block_threshold
+        )
+        self.ads_filter = AdsFilter(config=config, is_viewed_fn=self.is_viewed)
+        log_config(config=self.config, version=VERSION)
+
+
+    def get_proxy_obj(self) -> Proxy | None:
+        if all([self.config.proxy_string, self.config.proxy_change_url]):
+            return Proxy(
+                proxy_string=self.config.proxy_string,
+                change_ip_link=self.config.proxy_change_url
+            )
+        logger.info("Работаем без прокси")
+        return None
+
+    def fetch_data(self, url: str) -> str | None:
+        if self.stop_event and self.stop_event.is_set():
+            return None
+
+        try:
+            response = self.http.request("GET", url)
+            self.good_request_count += 1
+            return response.text
+
+        except Exception as err:
+            self.bad_request_count += 1
+            logger.warning(f"Ошибка при запросе {url}: {err}")
+            return None
+
+    @staticmethod
+    def _api_url_for_page(api_url: str, page: int) -> str:
+        parts = urlsplit(api_url)
+        query = parse_qsl(parts.query, keep_blank_values=True)
+        page_key = next(
+            (key for key, _ in query if key in {"p", "page"}),
+            "p",
+        )
+        query = [(key, value) for key, value in query if key not in {"p", "page"}]
+        query.append(("page", str(page)))
+        return urlunsplit(
+            (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
+        )
+
+    def fetch_api_data(self, api_url: str, page: int) -> dict | None:
+        if self.stop_event and self.stop_event.is_set():
+            return None
+
+        page_url = self._api_url_for_page(api_url, page)
+        try:
+            response = self.http.request("GET", page_url)
+            self.good_request_count += 1
+            return response.json()
+        except Exception as err:
+            self.bad_request_count += 1
+            logger.warning(f"Ошибка при запросе API {page_url}: {err}")
+            return None
+
+    @staticmethod
+    def _extract_api_catalog(payload: dict) -> dict:
+        if not isinstance(payload, dict):
+            return {}
+
+        result = payload.get("result")
+        candidates = [
+            payload.get("catalog"),
+            result.get("catalog") if isinstance(result, dict) else None,
+            result,
+            payload,
+        ]
+        return next(
+            (
+                candidate
+                for candidate in candidates
+                if isinstance(candidate, dict)
+                and isinstance(candidate.get("items"), list)
+            ),
+            {},
+        )
+    def parse(self):
+        if not self.config.one_file_for_link:
+            self.result_storage = build_result_storage(config=self.config)
+
+        api_urls = {}
+        for source_url in self.config.urls:
+            if self.stop_event and self.stop_event.is_set():
+                return
+            try:
+                api_urls[source_url] = self.url_converter.convert(source_url)
+            except Exception as err:
+                logger.error(
+                    f"Не удалось преобразовать ссылку Avito в API URL "
+                    f"{source_url}: {err}"
+                )
+
+        for link_index, source_url in enumerate(self.config.urls):
+            api_url = api_urls.get(source_url)
+            if not api_url:
+                continue
+
+            if self.config.one_file_for_link:
+                self.result_storage = build_result_storage(
+                    config=self.config,
+                    link_index=link_index,
+                )
+
+            ads_in_link = []
+            for page in range(1, self.config.count + 1):
+                logger.info(f"page={page}")
+                if self.stop_event and self.stop_event.is_set():
+                    return
+
+                json_data = self.fetch_api_data(api_url=api_url, page=page)
+                if not json_data:
+                    logger.warning(
+                        f"Не удалось получить данные API для {source_url}, "
+                        f"повтор через {self.config.pause_between_links} сек."
+                    )
+                    time.sleep(self.config.pause_between_links)
+                    continue
+
+                catalog = self._extract_api_catalog(json_data)
+                try:
+                    ads_models = ItemsResponse(**catalog)
+                except ValidationError as err:
+                    logger.error(
+                        f"При валидации объявлений произошла ошибка: {err}"
+                    )
+                    continue
+
+                ads = self._clean_null_ads(ads=ads_models.items)
+                logger.info(f"Объявлений перед фильтрацией {len(ads)}")
+                ads = self._add_seller_to_ads(ads=ads)
+                ads = self._add_promotion_to_ads(ads=ads)
+
+                if not ads:
+                    logger.info(
+                        "Объявления закончились, завершаю работу с данной ссылкой"
+                    )
+                    break
+
+                filtered_ads = self.filter_ads(ads=ads)
+                self.notifier.notify_many(ads=filtered_ads)
+                filtered_ads = self.parse_views(ads=filtered_ads)
+                filtered_ads = self.parse_description(ads=filtered_ads)
+                filtered_ads = self.parse_phone(ads=filtered_ads)
+
+                if filtered_ads:
+                    logger.info(f"Сохраняю {len(filtered_ads)} объявлений")
+                    self.result_storage.save(filtered_ads)
+                    self.__save_viewed(ads=filtered_ads)
+                    ads_in_link.extend(filtered_ads)
+
+                logger.info(f"Пауза {self.config.pause_between_links} сек.")
+                time.sleep(self.config.pause_between_links)
+
+            if ads_in_link:
+                logger.info(
+                    f"Всего сохранено по ссылке: {len(ads_in_link)} объявлений"
+                )
+            else:
+                logger.info("Сохранять нечего")
+
+        logger.info(
+            f"Хорошие запросы: {self.good_request_count}шт, "
+            f"плохие: {self.bad_request_count}шт"
+        )
+
+        if self.config.one_time_start:
+            self.notifier.notify(
+                message="Парсинг Авито завершён. Все ссылки обработаны"
+            )
+            if self.stop_event is not None and hasattr(self.stop_event, "set"):
+                self.stop_event.set()
+    @staticmethod
+    def _clean_null_ads(ads: list[Item]) -> list[Item]:
+        return [ad for ad in ads if ad.id]
+
+    @staticmethod
+    def find_json_on_page(html_code, data_type: str = "mime") -> dict:
+        import html as html_lib
+        html_code = BeautifulSoup(html_code, "html.parser")
+        try:
+            for _script in html_code.select('script'):
+
+                script_type = _script.get('type')
+
+                if data_type == 'mime':
+                    for script in html_code.select('script'):
+                        if script.get('type') == 'mime/invalid' and script.get('data-mfe-state') == 'true' and 'sandbox' not in script.text:
+                            data = json.loads(html_lib.unescape(script.text))
+                            if data.get('i18n', {}).get('hasMessages'):
+                                return data.get('loaderData', {}).get("data", {})
+
+        except Exception as err:
+            logger.error(f"Ошибка при поиске информации на странице: {err}")
+        logger.warning("not found json")
+        return {}
+
+
+    def filter_ads(self, ads: list[Item]) -> list[Item]:
+        return self.ads_filter.apply(ads)
+
+    def _add_seller_to_ads(self, ads: list[Item]) -> list[Item]:
+        for ad in ads:
+            if seller_id := self._extract_seller_slug(data=ad):
+                ad.sellerId = seller_id
+        return ads
+
+    @staticmethod
+    def _add_promotion_to_ads(ads: list[Item]) -> list[Item]:
+        for ad in ads:
+            steps = (ad.iva or {}).get("DateInfoStep") if isinstance(ad.iva, dict) else []
+            ad.isPromotion = any(
+                isinstance(v, dict) and v.get("title") == "Продвинуто"
+                for step in (steps or [])
+                for v in (
+                    (getattr(step, "payload", None) or (step.get("payload") if isinstance(step, dict) else None) or {}).get("vas")
+                    or []
+                )
+            )
+        return ads
+
+    @staticmethod
+    def _extract_item_details(payload: dict) -> tuple[str | None, int | None, int | None]:
+        def nested_dict(value, *keys):
+            for key in keys:
+                if not isinstance(value, dict):
+                    return {}
+                value = value.get(key)
+            return value if isinstance(value, dict) else {}
+
+        mobile = nested_dict(payload, "success", "mobile")
+        mobile_views = nested_dict(mobile, "stats", "views")
+        card_params = nested_dict(
+            payload, "success", "view", "scenario", "beduin", "main", "params"
+        )
+        card_views = nested_dict(card_params, "metaDataAndStats", "views")
+
+        def count(value):
+            if isinstance(value, bool):
+                return None
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str):
+                digits = "".join(char for char in value if char.isdigit())
+                return int(digits) if digits else None
+            return None
+
+        total = count(mobile_views.get("total"))
+        today = count(mobile_views.get("today"))
+        if total is None:
+            total = count(card_views.get("total"))
+        if today is None:
+            today = count(
+                card_views.get("today")
+                or card_views.get("todayViews")
+                or card_views.get("today_views")
+            )
+
+        description = mobile.get("description")
+        description = description.strip() if isinstance(description, str) else None
+        if not description:
+            segments = nested_dict(card_params, "description").get("segments")
+            if isinstance(segments, list):
+                description = "".join(
+                    segment["text"]
+                    for segment in segments
+                    if isinstance(segment, dict)
+                    and isinstance(segment.get("text"), str)
+                )
+                description = description.replace("\u2028", "\n").strip() or None
+
+        return description or None, total, today
+
+    def _enrich_ads(self, ads: list[Item], *, views: bool, description: bool) -> list[Item]:
+        total_ads = len(ads)
+        for index, ad in enumerate(ads, start=1):
+            if self.stop_event and self.stop_event.is_set():
+                break
+            if not isinstance(ad.id, int) or isinstance(ad.id, bool):
+                logger.warning(f"Пропускаю объявление без числового ID: {ad.id}")
+                continue
+
+            try:
+                payload = self.http.fetch_item_data(ad.id)
+                self.good_request_count += 1
+            except Exception as err:
+                self.bad_request_count += 1
+                logger.warning(f"Ошибка при запросе карточки {ad.id}: {err}")
+                continue
+            try:
+                full_description, total_views, today_views = self._extract_item_details(payload)
+                if views:
+                    ad.total_views = total_views
+                    ad.today_views = today_views
+                    logger.info(
+                        f"id {ad.id} ({index}/{total_ads}) - "
+                        f"{total_views if total_views is not None else 'нет данных'} просмотров всего, "
+                        f"{today_views if today_views is not None else 'нет данных'} сегодня"
+                    )
+                if description and full_description:
+                    ad.description = full_description
+            except Exception as err:
+                logger.warning(f"Ошибка при разборе карточки {ad.id}: {err}")
+                continue
+            time.sleep(random.uniform(0.1, 0.9))
+        return ads
+
+    def parse_views(self, ads: list[Item]) -> list[Item]:
+        if not self.config.parse_views:
+            return ads
+
+        logger.info("Начинаю парсинг просмотров")
+        return self._enrich_ads(
+            ads, views=True, description=getattr(self.config, "parse_description", False)
+        )
+
+    def parse_description(self, ads: list[Item]) -> list[Item]:
+        if not getattr(self.config, "parse_description", False) or self.config.parse_views:
+            return ads
+
+        logger.info("Начинаю парсинг полного описания")
+        return self._enrich_ads(ads, views=False, description=True)
+
+    def parse_phone(self, ads: list[Item]) -> list[Item]:
+        if not self.config.parse_phone or self.config.parse_phone:
+            # future feat, not ready yet
+            return ads
+
+        try:
+            return ParsePhone(ads=ads, config=self.config).parse_phones()
+        except Exception as err:
+            logger.warning(f"Ошибка при парсинге телефонов: {err}")
+            return ads
+
+    @staticmethod
+    def _extract_views(html: str) -> tuple:
+        soup = BeautifulSoup(html, "html.parser")
+
+        def extract_digits(element):
+            return int(''.join(filter(str.isdigit, element.get_text()))) if element else None
+
+        total = extract_digits(soup.select_one('[data-marker="item-view/total-views"]'))
+        today = extract_digits(soup.select_one('[data-marker="item-view/today-views"]'))
+
+        return total, today
+
+    @staticmethod
+    def _extract_description(html: str) -> str | None:
+        """Извлекает полный текст описания объявления со страницы Avito (Issue #305)."""
+        soup = BeautifulSoup(html, "html.parser")
+
+        # 1. Поиск по data-marker (основной маркер Avito для описания)
+        desc_el = soup.select_one('[data-marker="item-description/text"]')
+        if desc_el:
+            text = desc_el.get_text(separator="\n", strip=True)
+            if text:
+                return text
+
+        # 2. Поиск по микроразметке Schema.org
+        desc_meta = soup.select_one('[itemprop="description"]')
+        if desc_meta:
+            text = desc_meta.get_text(separator="\n", strip=True)
+            if text:
+                return text
+
+        # 3. Поиск в JSON-состоянии страницы
+        try:
+            import html as html_lib
+            for script in soup.select('script[type="mime/invalid"][data-mfe-state="true"]'):
+                if 'sandbox' not in script.text:
+                    data = json.loads(html_lib.unescape(script.text))
+                    item_data = data.get('loaderData', {}).get("data", {}).get("item", {})
+                    if desc := item_data.get("description"):
+                        return desc.strip()
+        except Exception:
+            pass
+
+        return None
+
+    @staticmethod
+    def _extract_seller_slug(data):
+        match = re.search(r"/brands/([^/?#]+)", str(data))
+        if match:
+            return match.group(1)
+        return None
+
+    def is_viewed(self, ad: Item) -> bool:
+        """Проверяет, смотрели мы это или нет"""
+        price = (
+            ad.priceDetailed.value
+            if (ad.priceDetailed and getattr(ad.priceDetailed, "value", None) is not None)
+            else 0
+        )
+        return self.db_handler.record_exists(record_id=ad.id, price=price)
+
+    @staticmethod
+    def _is_recent(timestamp_ms: int, max_age_seconds: int) -> bool:
+        from datetime import timezone
+        now = datetime.now(timezone.utc)
+        try:
+            published_time = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+            return (now - published_time) <= timedelta(seconds=max_age_seconds)
+        except Exception:
+            return False
+
+    def __save_viewed(self, ads: list[Item]) -> None:
+        """Сохраняет просмотренные объявления"""
+        try:
+            self.db_handler.add_record_from_page(ads=ads)
+        except Exception as err:
+            logger.info(f"При сохранении в БД ошибка {err}")
+
+
+if __name__ == "__main__":
+    try:
+        config = load_avito_config("config.toml")
+    except Exception as err:
+        logger.error(f"Ошибка загрузки конфига: {err}")
+        exit(1)
+
+    if config.use_bypass_api and not (config.proxy_string or "").strip():
+        logger.critical(f"SPFA не будет работать без прокси. {SPFA_PROXY_REQUIRED}")
+        exit(1)
+
+    if config.use_bypass_api and not config.proxy_change_url:
+        logger.warning(
+            "SPFA запущен с серверным (статическим) прокси. Если будет много ошибок - установить большие "
+            "pause_between_links и pause_general, чтобы снизить риск блокировок."
+        )
+
+    while True:
+        try:
+            parser = AvitoParse(config)
+            parser.parse()
+            if config.one_time_start:
+                logger.info("Парсинг завершен т.к. включён one_time_start в настройках")
+                break
+            logger.info(f"Парсинг завершен. Пауза {config.pause_general} сек")
+            time.sleep(config.pause_general)
+        except Exception as err:
+            logger.exception(err)
+            logger.error(f"Произошла ошибка {err}. Будет повторный запуск через 30 сек.")
+            time.sleep(30)
