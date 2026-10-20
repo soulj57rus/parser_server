@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Runtime data (docker-compose bind mounts)
+cookies.json
+database.db
+*.db
+logs/
+result/
+storage/
+
+# IntelliJ / PyCharm / VS Code
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db

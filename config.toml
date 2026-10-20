@@ -1,25 +1,26 @@
 [avito]
 tg_token = ""
 tg_chat_id = []
-vk_token = ""
-vk_user_id = []
+vk_token = "vk1.a.tqG2wtnaXk2LTLjbVrTqTeBSPDr0sSfm6IAl-TMnLISEvOJaui8aKy7qeQfqq5vCJLqV93lSIGtknIw37vMLyNOH_8iDFEkHw9VNFCsY3M5kuzv-fscNdsRAKP2IkqMz3Kb8aDCLrQJph99OHHwkUIj83wlLrvHNhl6warSd4QeghaWK5bXdNiZMCX-YstWiVwiVkDnGBZy33kP2Crn1yQ"
+vk_user_id = ["700997804"]
 urls = [
-    "https://www.avito.ru/all/gruzoviki_i_spetstehnika/buldozery-ASgBAgICAURU3E0?cd=1",
-    "https://www.avito.ru/krasnodar/telefony/mobilnye_telefony/apple/iphone_16-ASgBAgICA0SywA3GsYwVtMANzqs5sMENiPw3?cd=1",
+    "https://m.avito.ru/all/audio_i_video?context=H4sIAAAAAAAA_wE8AMP_YToyOntzOjg6ImZyb21QYWdlIjtzOjY6ImlubGluZSI7czoxNDoiaGFzRXh0cmFQYXJhbXMiO2I6MTt9bRCyeTwAAAA&geoCoords=55.755814%2C37.617635&presentationType=serp&q=умная%20колонка&radius=0&s=104",
+    "https://www.avito.ru/all?cd=1&q=колонка+алиса&s=104",
+    "https://www.avito.ru/all/audio_i_video/akustika_kolonki_sabvufery-ASgBAgICAUSIAsxO?cd=1&context=H4sIAAAAAAAA_wEmANn_YToxOntzOjE6InkiO3M6MTY6IkZwNkt6U1FjS2ticXBjeUoiO3324eqEJgAAAA&q=яндекс+станция&s=104",
 ]
 count = 1
 keys_word_white_list = []
 keys_word_black_list = []
 seller_black_list = []
-max_price = 99999999
+max_price = 18000
 min_price = 0
 geo = ""
 proxy_string = ""
 proxy_change_url = ""
-pause_general = 1
-pause_between_links = 1
-max_age = 0
-max_count_of_retry = 5
+pause_general = 20
+pause_between_links = 3
+max_age = 1600
+max_count_of_retry = 2
 ignore_reserv = true
 ignore_promotion = false
 one_time_start = false
@@ -35,7 +36,7 @@ parse_phone = false
 proxy_notifier = ""
 tg_only_text = false
 retry_delay = 5
-timeout = 20
-block_threshold = 3
+timeout = 10
+block_threshold = 2
 log_retention_days = 5
 log_max_files = 10
