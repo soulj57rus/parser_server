@@ -3,7 +3,7 @@ from loguru import logger
 
 from integrations.notifications.base import Notifier
 from integrations.notifications.transport import send_with_retries
-from integrations.notifications.utils import get_first_image
+from integrations.notifications.utils import build_proxies, get_first_image
 from models import Item
 
 
@@ -16,12 +16,7 @@ class TelegramNotifier(Notifier):
 
     @staticmethod
     def get_proxy(proxy: str = None):
-        if proxy:
-            return {
-            'http': f'http://{proxy}',
-            'https': f'http://{proxy}'
-        }
-        return None
+        return build_proxies(proxy)
 
     def notify_message(self, message: str):
         def _send():
@@ -37,8 +32,9 @@ class TelegramNotifier(Notifier):
             )
 
         send_with_retries(_send)
+        return True
 
-    def _send_text_fallback(self, message: str) -> None:
+    def _send_text_fallback(self, message: str) -> bool:
         def _send():
             return requests.post(
                 f"https://api.telegram.org/bot{self.bot_token}/sendMessage",
@@ -53,6 +49,7 @@ class TelegramNotifier(Notifier):
             )
 
         send_with_retries(_send)
+        return True
 
     def _send_photo_bytes(self, image_url: str, message: str) -> bool:
         """Download the image locally and re-upload to Telegram as multipart.
@@ -85,27 +82,18 @@ class TelegramNotifier(Notifier):
 
     def notify_ad(self, ad: Item):
         message = self.format(ad)
+        image_url = get_first_image(ad=ad)
 
-        def _send():
-            if self.only_text:
-                return requests.post(
-                    f"https://api.telegram.org/bot{self.bot_token}/sendMessage",
-                    json={
-                        "chat_id": self.chat_id,
-                        "text": message,
-                        "parse_mode": "MarkdownV2",
-                        "disable_web_page_preview": True,
-                    },
-                    proxies=self.proxy,
-                    timeout=10,
-                )
+        if self.only_text or not image_url:
+            return self._send_text_fallback(message=message)
 
+        def _send_photo():
             return requests.post(
                 f"https://api.telegram.org/bot{self.bot_token}/sendPhoto",
                 json={
                     "chat_id": self.chat_id,
                     "caption": message,
-                    "photo": get_first_image(ad=ad),
+                    "photo": image_url,
                     "parse_mode": "MarkdownV2",
                     "disable_web_page_preview": True,
                 },
@@ -114,19 +102,32 @@ class TelegramNotifier(Notifier):
             )
 
         try:
-            send_with_retries(_send)
+            send_with_retries(_send_photo)
+            return True
         except requests.HTTPError as e:
             resp = e.response
-            if not self.only_text and resp is not None and resp.status_code == 400:
-                image_url = get_first_image(ad=ad)
-                if image_url:
-                    logger.info("[notify] sendPhoto URL rejected (400), retrying with image bytes")
-                    uploaded = self._send_photo_bytes(image_url=image_url, message=message)
-                    if not uploaded:
-                        logger.warning("[notify] multipart upload also failed, falling back to text-only")
-                        self._send_text_fallback(message=message)
-                    return
-            raise
+            if resp is None or resp.status_code != 400:
+                logger.warning(
+                    f"[notify] не удалось отправить фото ({e}), отправляю текст"
+                )
+                return self._send_text_fallback(message=message)
+        except requests.RequestException as e:
+            logger.warning(
+                f"[notify] сетевая ошибка при отправке фото ({e}), отправляю текст"
+            )
+            return self._send_text_fallback(message=message)
+
+        logger.info("[notify] sendPhoto отклонён, повторяю с загрузкой картинки")
+        try:
+            uploaded = self._send_photo_bytes(image_url=image_url, message=message)
+        except requests.RequestException as e:
+            logger.warning(f"[notify] multipart upload failed: {e}")
+            uploaded = False
+
+        if not uploaded:
+            logger.warning("[notify] фото не отправлено, отправляю только текст")
+            return self._send_text_fallback(message=message)
+        return True
 
     def notify(self, ad: Item = None, message: str = None):
         if ad:

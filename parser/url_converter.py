@@ -8,6 +8,7 @@ from loguru import logger
 
 
 SPFA_AVITO_URL_ENDPOINT = "https://spfa.pro/api/avito-url/"
+RETRYABLE_STATUS_CODES = {429, 502, 503, 504}
 
 
 class AvitoUrlConverter:
@@ -21,10 +22,12 @@ class AvitoUrlConverter:
         cache_path: str | Path = "storage/avito_api_urls.json",
         min_request_interval: float = 31.0,
         timeout: int = 20,
+        max_attempts: int = 2,
     ):
         self.cache_path = Path(cache_path)
         self.min_request_interval = min_request_interval
         self.timeout = timeout
+        self.max_attempts = max(1, max_attempts)
         self._cache = self._load_cache()
 
     def convert(self, url: str) -> str:
@@ -41,35 +44,72 @@ class AvitoUrlConverter:
             if cached_url:
                 return cached_url
 
-            self._wait_for_rate_limit()
-            response = requests.post(
-                SPFA_AVITO_URL_ENDPOINT,
-                json={"url": url},
-                headers={"Content-Type": "application/json"},
-                timeout=self.timeout,
-            )
-            type(self)._last_request_at = time.monotonic()
+            last_error: Exception | None = None
+            for attempt in range(1, self.max_attempts + 1):
+                self._wait_for_rate_limit()
+                try:
+                    response = requests.post(
+                        SPFA_AVITO_URL_ENDPOINT,
+                        json={"url": url},
+                        headers={"Content-Type": "application/json"},
+                        timeout=self.timeout,
+                    )
+                except requests.RequestException as error:
+                    last_error = error
+                    logger.warning(
+                        f"SPFA: сетевая ошибка при преобразовании {url} "
+                        f"(попытка {attempt}/{self.max_attempts}): {error}"
+                    )
+                    if attempt < self.max_attempts:
+                        continue
+                    raise RuntimeError(
+                        "Не удалось подключиться к SPFA для преобразования URL"
+                    ) from error
+                finally:
+                    type(self)._last_request_at = time.monotonic()
 
-            if response.status_code != 200:
-                raise RuntimeError(self._format_error(response))
+                if response.status_code != 200:
+                    error = RuntimeError(self._format_error(response))
+                    if (
+                        response.status_code in RETRYABLE_STATUS_CODES
+                        and attempt < self.max_attempts
+                    ):
+                        logger.warning(
+                            f"SPFA: временная ошибка {response.status_code} "
+                            f"(попытка {attempt}/{self.max_attempts}), повторяю"
+                        )
+                        last_error = error
+                        continue
+                    raise error
 
-            try:
-                payload = response.json()
-            except ValueError as error:
-                raise RuntimeError(
-                    "SPFA вернул некорректный JSON при преобразовании URL"
-                ) from error
+                try:
+                    payload = response.json()
+                except ValueError as error:
+                    last_error = error
+                    logger.warning(
+                        f"SPFA: некорректный JSON "
+                        f"(попытка {attempt}/{self.max_attempts})"
+                    )
+                    if attempt < self.max_attempts:
+                        continue
+                    raise RuntimeError(
+                        "SPFA вернул некорректный JSON при преобразовании URL"
+                    ) from error
 
-            api_url = payload.get("api_url")
-            if not payload.get("success") or not api_url:
-                raise RuntimeError(
-                    "SPFA не вернул api_url для ссылки Avito"
-                )
+                api_url = payload.get("api_url")
+                if not payload.get("success") or not api_url:
+                    raise RuntimeError(
+                        "SPFA не вернул api_url для ссылки Avito"
+                    )
 
-            self._cache[url] = api_url
-            self._save_cache()
-            logger.info(f"Ссылка Avito преобразована в API URL: {url}")
-            return api_url
+                self._cache[url] = api_url
+                self._save_cache()
+                logger.info(f"Ссылка Avito преобразована в API URL: {url}")
+                return api_url
+
+            raise RuntimeError(
+                "Не удалось преобразовать ссылку Avito в API URL"
+            ) from last_error
 
     def _wait_for_rate_limit(self) -> None:
         elapsed = time.monotonic() - type(self)._last_request_at

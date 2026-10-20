@@ -1,48 +1,98 @@
+import random
+
 import requests
 from loguru import logger
 
 from integrations.notifications.base import Notifier
 from integrations.notifications.transport import send_with_retries
-from integrations.notifications.utils import get_first_image
+from integrations.notifications.utils import build_proxies, get_first_image
 from models import Item
+
+VK_RETRYABLE_ERROR_CODES = {6, 9, 10}
 
 
 class VKNotifier(Notifier):
-    def __init__(self, vk_token: str, user_id: str | int):
+    def __init__(
+        self,
+        vk_token: str,
+        user_id: str | int,
+        proxy: str = None,
+        only_text: bool = False,
+    ):
         self.vk_token = vk_token
         self.user_id = user_id
+        self.proxy = build_proxies(proxy)
+        self.only_text = only_text
+
+    @staticmethod
+    def _random_id() -> int:
+        return random.randint(1, 2 ** 31 - 1)
+
+    @staticmethod
+    def _check_vk_response(response: requests.Response) -> None:
+        """Повторяем при временных ошибках VK API (200 + error_code)."""
+        try:
+            body = response.json()
+        except ValueError:
+            return
+        if not isinstance(body, dict) or "error" not in body:
+            return
+        error_code = body["error"].get("error_code", 0)
+        if error_code in VK_RETRYABLE_ERROR_CODES:
+            raise requests.HTTPError(
+                f"VK retryable error {error_code}", response=response
+            )
 
     def notify_message(self, message: str):
+        random_id = self._random_id()
+
         def _send():
             headers = {
                 "Authorization": f"Bearer {self.vk_token}"
             }
-            return requests.post(
+            response = requests.post(
                 "https://api.vk.com/method/messages.send",
                 headers=headers,
                 data={
                     "user_id": self.user_id,
-                    "random_id": 0,
+                    "random_id": random_id,
                     "message": message,
                     "v": "5.199"
                 },
+                proxies=self.proxy,
                 timeout=10,
             )
+            self._check_vk_response(response)
+            return response
 
-        send_with_retries(_send)
+        response = send_with_retries(_send)
+        if response is None:
+            return False
+        body = response.json()
+        if not isinstance(body, dict):
+            return False
+        if "error" in body:
+            logger.warning(
+                f"VK API error {body['error'].get('error_code', 0)}: "
+                f"{body['error'].get('error_msg', 'Unknown error')}"
+            )
+            return False
+        return True
 
     def notify_ad(self, ad: Item):
-        def _send():
-            message = self.format_ad(ad)
-            _image_url = get_first_image(ad=ad)
+        random_id = self._random_id()
+        message = self.format_ad(ad)
 
-            # Загружаем фото если есть
-            attachment = None
+        attachment = None
+        if not self.only_text:
+            _image_url = get_first_image(ad=ad)
             if _image_url:
                 attachment = self.__upload_photo_to_vk(_image_url, str(self.user_id))
+
+        def _send():
             payload = {
                 "user_id": self.user_id,
-                "random_id": 0,
+                "random_id": random_id,
                 "message": message,
                 "v": "5.199"
             }
@@ -53,27 +103,35 @@ class VKNotifier(Notifier):
                 "Authorization": f"Bearer {self.vk_token}"
             }
 
-            return requests.post(
+            response = requests.post(
                 "https://api.vk.com/method/messages.send",
                 data=payload,
                 headers=headers,
+                proxies=self.proxy,
                 timeout=10,
             )
+            self._check_vk_response(response)
+            return response
 
         response = send_with_retries(_send)
         if response is None:
             logger.warning("VK: не удалось отправить сообщение")
-            return
+            return False
 
         body = response.json()
+
+        if not isinstance(body, dict):
+            logger.warning("VK: неожиданный ответ API")
+            return False
 
         if "error" in body:
             error_msg = body["error"].get("error_msg", "Unknown error")
             error_code = body["error"].get("error_code", 0)
             logger.warning(f"VK API error {error_code}: {error_msg}")
-            return
+            return False
 
         logger.debug(f"Сообщение успешно отправлено")
+        return True
 
     def notify(self, ad: Item = None, message: str = None):
         if ad:
@@ -89,7 +147,9 @@ class VKNotifier(Notifier):
             upload_server_response = requests.post(
                 "https://api.vk.com/method/photos.getMessagesUploadServer",
                 headers=headers,
-                params={"v": "5.199"}
+                params={"v": "5.199"},
+                proxies=self.proxy,
+                timeout=10,
             ).json()
 
             if "error" in upload_server_response:
@@ -99,10 +159,14 @@ class VKNotifier(Notifier):
             upload_url = upload_server_response["response"]["upload_url"]
 
             # Шаг 2: Скачиваем фото и загружаем на VK
-            photo_data = requests.get(photo_url, timeout=10).content
+            photo_data = requests.get(
+                photo_url, proxies=self.proxy, timeout=15
+            ).content
             upload_response = requests.post(
                 upload_url,
-                files={"photo": ("photo.jpg", photo_data, "image/jpeg")}
+                files={"photo": ("photo.jpg", photo_data, "image/jpeg")},
+                proxies=self.proxy,
+                timeout=30,
             ).json()
 
             if not upload_response.get("photo") or upload_response.get("photo") == "[]":
@@ -118,7 +182,9 @@ class VKNotifier(Notifier):
                     "server": upload_response["server"],
                     "hash": upload_response["hash"],
                     "v": "5.199"
-                }
+                },
+                proxies=self.proxy,
+                timeout=10,
             ).json()
 
             if "error" in save_response:

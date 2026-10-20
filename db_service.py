@@ -18,9 +18,14 @@ class SQLiteDBHandler:
             self._create_table()
             self._initialized = True
 
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_name, timeout=5)
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+
     def _create_table(self):
-        """Создает таблицу viewed, если она не существует."""
-        with sqlite3.connect(self.db_name) as conn:
+        """Создает таблицу viewed и индексы, удаляет старые дубли."""
+        with self._connect() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
@@ -30,40 +35,56 @@ class SQLiteDBHandler:
                 )
                 """
             )
+            cursor.execute(
+                """
+                DELETE FROM viewed
+                WHERE rowid NOT IN (
+                    SELECT MIN(rowid) FROM viewed GROUP BY id, price
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_viewed_id_price
+                ON viewed (id, price)
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS ix_viewed_id
+                ON viewed (id)
+                """
+            )
             conn.commit()
 
-    def add_record(self, ad: Item):
-        """Добавляет новую запись в таблицу viewed."""
+    @staticmethod
+    def _record(ad: Item) -> tuple:
         price = (
             ad.priceDetailed.value
             if (ad.priceDetailed and getattr(ad.priceDetailed, "value", None) is not None)
             else 0
         )
-        with sqlite3.connect(self.db_name) as conn:
+        return ad.id, price
+
+    def add_record(self, ad: Item):
+        """Добавляет новую запись в таблицу viewed."""
+        with self._connect() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT INTO viewed (id, price) VALUES (?, ?)",
-                (ad.id, price),
+                "INSERT OR IGNORE INTO viewed (id, price) VALUES (?, ?)",
+                self._record(ad),
             )
             conn.commit()
 
     def add_record_from_page(self, ads: list[Item]):
         """Добавляет несколько записей в таблицу viewed."""
-        records = [
-            (
-                ad.id,
-                ad.priceDetailed.value
-                if (ad.priceDetailed and getattr(ad.priceDetailed, "value", None) is not None)
-                else 0,
-            )
-            for ad in ads
-        ]
+        records = [self._record(ad) for ad in ads]
 
-        with sqlite3.connect(self.db_name) as conn:
+        with self._connect() as conn:
             cursor = conn.cursor()
             cursor.executemany(
                 """
-                INSERT OR REPLACE INTO viewed (id, price)
+                INSERT OR IGNORE INTO viewed (id, price)
                 VALUES (?, ?)
                 """,
                 records,
@@ -72,7 +93,7 @@ class SQLiteDBHandler:
 
     def record_exists(self, record_id, price):
         """Проверяет, существует ли запись с заданными id и price."""
-        with sqlite3.connect(self.db_name) as conn:
+        with self._connect() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 "SELECT 1 FROM viewed WHERE id = ? AND price = ?",

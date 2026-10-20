@@ -141,21 +141,17 @@ class AvitoParse:
         if not self.config.one_file_for_link:
             self.result_storage = build_result_storage(config=self.config)
 
-        api_urls = {}
-        for source_url in self.config.urls:
+        for link_index, source_url in enumerate(self.config.urls):
             if self.stop_event and self.stop_event.is_set():
                 return
+
             try:
-                api_urls[source_url] = self.url_converter.convert(source_url)
+                api_url = self.url_converter.convert(source_url)
             except Exception as err:
                 logger.error(
                     f"Не удалось преобразовать ссылку Avito в API URL "
                     f"{source_url}: {err}"
                 )
-
-        for link_index, source_url in enumerate(self.config.urls):
-            api_url = api_urls.get(source_url)
-            if not api_url:
                 continue
 
             if self.config.one_file_for_link:
@@ -174,10 +170,9 @@ class AvitoParse:
                 if not json_data:
                     logger.warning(
                         f"Не удалось получить данные API для {source_url}, "
-                        f"повтор через {self.config.pause_between_links} сек."
+                        f"страница {page}. Повтор в следующем цикле."
                     )
-                    time.sleep(self.config.pause_between_links)
-                    continue
+                    break
 
                 catalog = self._extract_api_catalog(json_data)
                 try:
@@ -200,7 +195,13 @@ class AvitoParse:
                     break
 
                 filtered_ads = self.filter_ads(ads=ads)
-                self.notifier.notify_many(ads=filtered_ads)
+                delivered_ads = self.notifier.notify_many(ads=filtered_ads)
+                if len(delivered_ads) < len(filtered_ads):
+                    logger.warning(
+                        f"Доставлено {len(delivered_ads)} из "
+                        f"{len(filtered_ads)} уведомлений; "
+                        f"недоставленные будут повторены в следующем цикле"
+                    )
                 filtered_ads = self.parse_views(ads=filtered_ads)
                 filtered_ads = self.parse_description(ads=filtered_ads)
                 filtered_ads = self.parse_phone(ads=filtered_ads)
@@ -208,11 +209,15 @@ class AvitoParse:
                 if filtered_ads:
                     logger.info(f"Сохраняю {len(filtered_ads)} объявлений")
                     self.result_storage.save(filtered_ads)
-                    self.__save_viewed(ads=filtered_ads)
+                    if delivered_ads:
+                        self.__save_viewed(ads=delivered_ads)
                     ads_in_link.extend(filtered_ads)
 
-                logger.info(f"Пауза {self.config.pause_between_links} сек.")
-                time.sleep(self.config.pause_between_links)
+                has_more_pages = page < self.config.count
+                has_more_links = link_index < len(self.config.urls) - 1
+                if has_more_pages or has_more_links:
+                    logger.info(f"Пауза {self.config.pause_between_links} сек.")
+                    time.sleep(self.config.pause_between_links)
 
             if ads_in_link:
                 logger.info(
