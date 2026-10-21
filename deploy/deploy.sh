@@ -72,7 +72,12 @@ say "Бэкапы сохранены: backups/*.$timestamp"
 set_env_tag "$TAG"
 
 say "Загрузка образа ${IMAGE_BASE}:${TAG}"
-docker compose pull -q 2>/dev/null || docker compose pull
+docker compose pull -q 2>/dev/null || docker compose pull \
+    || warn "Pull из реестра не удался (нет логина/тег только локальный) — продолжаю с локальным образом"
+docker image inspect "${IMAGE_BASE}:${TAG}" >/dev/null 2>&1 || {
+    die "Образ ${IMAGE_BASE}:${TAG} не найден ни в реестре, ни локально"
+    rollback_all
+}
 
 say "Тесты новой версии в изолированном контейнере (--rm; прод не трогается)..."
 if ! docker run --rm \
