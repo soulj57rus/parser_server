@@ -40,9 +40,20 @@ class ExcelStorage(ResultStorage):
         # lock для потокобезопасной записи
         self._lock = Lock()
 
+        # Рабочая книга держится в памяти: на каждой странице добавляем
+        # строки и сразу сохраняем файл (устойчивость к сбоям сохраняется),
+        # но больше не перечитываем весь xlsx заново — на длинных прогонах
+        # это заметно ускоряет сохранение.
+        self._workbook: Workbook | None = None
+
         # создаём файл, если его нет
         if not self.file_path.exists():
             self._create_file()
+
+    def _get_workbook(self) -> Workbook:
+        if self._workbook is None:
+            self._workbook = load_workbook(self.file_path)
+        return self._workbook
 
     def _create_file(self) -> None:
         workbook = Workbook()
@@ -107,7 +118,7 @@ class ExcelStorage(ResultStorage):
             return
 
         with self._lock:
-            workbook = load_workbook(self.file_path)
+            workbook = self._get_workbook()
             sheet = workbook.active
 
             for ad in ads:
