@@ -7,9 +7,12 @@ from models import Item
 
 
 class AdsFilter:
-    def __init__(self, config: AvitoConfig, is_viewed_fn=None):
+    def __init__(self, config: AvitoConfig, is_viewed_fn=None, is_viewed_many_fn=None):
         self.config = config
         self.is_viewed_fn = is_viewed_fn
+        # Пакетная проверка «просмотрено ли»: один SQL-запрос на страницу
+        # вместо отдельного запроса на каждое объявление
+        self.is_viewed_many_fn = is_viewed_many_fn
 
     def apply(self, ads: List[Item]) -> List[Item]:
         """Применяет все фильтры по порядку"""
@@ -33,6 +36,9 @@ class AdsFilter:
         return ads
 
     def _filter_viewed(self, ads: List[Item]) -> List[Item]:
+        if self.is_viewed_many_fn:
+            viewed_flags = self.is_viewed_many_fn(ads)
+            return [ad for ad, viewed in zip(ads, viewed_flags) if not viewed]
         if self.is_viewed_fn:
             return [ad for ad in ads if not self.is_viewed_fn(ad)]
         return ads
