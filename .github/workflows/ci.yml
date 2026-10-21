@@ -1,0 +1,52 @@
+# CI: тесты и валидация для каждого PR и пуша в develop/main
+name: CI
+
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop, main]
+  workflow_dispatch: {}
+
+jobs:
+  tests:
+    name: Тесты и проверки
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Установка зависимостей
+        run: pip install -q -r requirements.txt -r requirements-dev.txt
+
+      - name: Тесты (pytest)
+        run: python -m pytest tests -q
+
+      - name: Компиляция всех модулей (синтаксис)
+        run: python -m compileall -q parser_cls.py AvitoParser.py db_service.py models.py dto.py lang.py load_config.py common_data.py hide_private_data.py version.py filters parser utils integrations
+
+      - name: Синтаксис деплой-скриптов (bash)
+        run: |
+          bash -n deploy/deploy.sh
+          bash -n deploy/rollback.sh
+
+  docker-build:
+    name: Сборка Docker-образа
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Сборка (без публикации)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
