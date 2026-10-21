@@ -15,9 +15,13 @@ coverage.xml
 htmlcov/
 
 # Runtime data (docker-compose bind mounts)
+config.toml
 cookies.json
 database.db
 *.db
+database.db-journal
+database.db-wal
+database.db-shm
 logs/
 result/
 storage/
@@ -28,4 +32,3 @@ storage/
 
 # OS
 .DS_Store
-Thumbs.db

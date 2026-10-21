@@ -7,14 +7,17 @@ from models import Item
 class Notifier(ABC):
 
     @abstractmethod
-    def notify(self, ad: Item = None, message: str = None):
-        """Отправляем одно объявление"""
+    def notify(self, ad: Item = None, message: str = None) -> bool:
+        """Отправляем одно объявление. True/None — успех, False — ошибка."""
         pass
 
-    def notify_many(self, ads: list[Item]):
-        """Отправляем список объявлений"""
+    def notify_many(self, ads: list[Item]) -> list[Item]:
+        """Отправляет список объявлений и возвращает доставленные."""
+        delivered = []
         for ad in ads:
-            self.notify(ad=ad)
+            if self.notify(ad=ad) is not False:
+                delivered.append(ad)
+        return delivered
 
     # default форматирование
     def format(self, ad: Item) -> str:

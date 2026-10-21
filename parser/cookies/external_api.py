@@ -6,6 +6,7 @@ import requests
 from loguru import logger
 
 from parser.cookies.base import CookiesProvider
+from utils.pacing import interruptible_sleep
 
 API_URL = "https://spfa.pro/api"
 
@@ -19,12 +20,14 @@ class ExternalApiCookiesProvider(CookiesProvider):
         config,
         storage_path: str | Path = "storage/cookies_external.json",
         proxy=None,
+        stop_event=None,
     ):
         self.api_key = config.cookies_api_key
         self.proxy = config.proxy_string
         self.purchase_cooldown = config.purchase_cooldown
         self.storage_path = Path(storage_path)
         self.proxy_handler = proxy
+        self.stop_event = stop_event
 
         self.last_id: str | None = None
         self.last_cookies: dict | None = None
@@ -172,14 +175,14 @@ class ExternalApiCookiesProvider(CookiesProvider):
         if res.status_code in (200, 202):
             self.unblock_started_at = now
             logger.info(f"⏳ Разблокировка запущена | id={self.last_id}")
-            time.sleep(self.WAIT_FIRST_FOR_UNBLOCK)
+            interruptible_sleep(self.WAIT_FIRST_FOR_UNBLOCK, self.stop_event)
             return
 
         # ---- Уже в процессе ----
         if res.status_code == 409:
             self.unblock_started_at = self.unblock_started_at or now
             logger.info(f"⏳ Разблокировка уже выполняется | id={self.last_id}")
-            time.sleep(self.WAIT_FOR_UNBLOCK)
+            interruptible_sleep(self.WAIT_FOR_UNBLOCK, self.stop_event)
             return
 
         # ---- Слишком поздно ----
@@ -188,16 +191,16 @@ class ExternalApiCookiesProvider(CookiesProvider):
 
         # ---- Фатальные ошибки ----
         elif res.status_code == 403:
-            time.sleep(self.NOT_BALANCE)
+            interruptible_sleep(self.NOT_BALANCE, self.stop_event)
             logger.error("⛔ Доступ запрещён: неверный API key, нет прав или не хватает баланса")
 
         elif res.status_code == 404:
-            time.sleep(self.PAUSE_FOR_ERROR)
+            interruptible_sleep(self.PAUSE_FOR_ERROR, self.stop_event)
             logger.warning(f"❌ Cookies не найдены на сервере | id={self.last_id}")
 
         elif res.status_code == 503:
             logger.warning("🚧 Сервис временно недоступен, ждём")
-            time.sleep(self.PAUSE_FOR_ERROR)
+            interruptible_sleep(self.PAUSE_FOR_ERROR, self.stop_event)
             return
 
         else:
@@ -294,7 +297,7 @@ class ExternalApiCookiesProvider(CookiesProvider):
 
         self._save_to_disk()
         logger.debug("💾 Cookies сохранены на диск")
-        time.sleep(self.WAIT_FOR_NEW)
+        interruptible_sleep(self.WAIT_FOR_NEW, self.stop_event)
         return self.last_cookies
 
     def _handle_purchase_failure(self, pause: int | None = None) -> None:
@@ -307,7 +310,7 @@ class ExternalApiCookiesProvider(CookiesProvider):
                 )
 
         if pause is not None:
-            time.sleep(pause)
+            interruptible_sleep(pause, self.stop_event)
 
     def _save_to_disk(self):
         try:

@@ -30,6 +30,7 @@ class AvitoConfig:
     tg_chat_id: List[str] = None
     vk_token: Optional[str] = None
     vk_user_id: List[str] = None
+    vk_only_text: bool = False
     max_price: int = 999_999_999
     min_price: int = 0
     geo: Optional[str] = None
@@ -53,6 +54,7 @@ class AvitoConfig:
     use_own_cookies: bool = False
     parse_phone: bool = False
     proxy_notifier: str = None
+    vk_proxy: str = None
     tg_only_text: bool = False
     retry_delay: int = 5
     timeout: int = 20

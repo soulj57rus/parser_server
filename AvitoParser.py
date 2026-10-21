@@ -138,6 +138,8 @@ def main(page: ft.Page):
         clean_old_logs("logs", max_age_days=5, max_files=10)
         logger.add(logger_console_widget, format="{time:HH:mm:ss} - {message}")
 
+    _last_ui_refresh = [0.0]
+
     def logger_console_widget(message):
         MAX_LOG_LINES = 500
         console_widget.controls.append(
@@ -150,9 +152,15 @@ def main(page: ft.Page):
 
         # удаляем старые логи
         if len(console_widget.controls) > MAX_LOG_LINES:
-            console_widget.controls.pop(0)
+            del console_widget.controls[: len(console_widget.controls) - MAX_LOG_LINES]
 
-        page.update()
+        # Обновляем интерфейс не чаще 4 раз в секунду: во время парсинга
+        # логи идут потоком, и page.update() на каждую строку подвешивал
+        # окно и удлинял реакцию на «Стоп»
+        now = time.monotonic()
+        if now - _last_ui_refresh[0] >= 0.25:
+            _last_ui_refresh[0] = now
+            page.update()
 
     def telegram_log_test(e):
         """Тестирование отправки уведомлений"""

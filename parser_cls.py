@@ -19,11 +19,12 @@ from load_config import load_avito_config
 from models import ItemsResponse, Item
 from parser.cookies.factory import build_cookies_provider
 from parser.export.factory import build_result_storage
-from parser.http.client import HttpClient
+from parser.http.client import GOVERNOR, HttpClient
 from parser.proxies.proxy_factory import build_proxy
 from parser.url_converter import AvitoUrlConverter
 from utils.parse_phone import ParsePhone
 from utils.log_cleanup import clean_old_logs
+from utils.pacing import interruptible_sleep
 from version import VERSION
 from lang import SPFA_PROXY_REQUIRED
 
@@ -44,7 +45,10 @@ class AvitoParse:
         clean_old_logs("logs", max_age_days=retention_days, max_files=max_files)
 
         self.proxy = build_proxy(self.config)
-        self.cookies_provider = build_cookies_provider(config=config, proxy=self.proxy)
+        self.proxy.stop_event = stop_event
+        self.cookies_provider = build_cookies_provider(
+            config=config, proxy=self.proxy, stop_event=stop_event
+        )
         self.db_handler = SQLiteDBHandler()
         self.notifier = build_notifier(config=config)
         self.result_storage = None
@@ -59,10 +63,23 @@ class AvitoParse:
             timeout=config.timeout,
             max_retries=self.config.max_count_of_retry,
             retry_delay=config.retry_delay,
-            block_threshold=config.block_threshold
+            block_threshold=config.block_threshold,
+            stop_event=stop_event,
         )
-        self.ads_filter = AdsFilter(config=config, is_viewed_fn=self.is_viewed)
+        self.ads_filter = AdsFilter(
+            config=config,
+            is_viewed_fn=self.is_viewed,
+            is_viewed_many_fn=self._many_viewed,
+        )
         log_config(config=self.config, version=VERSION)
+
+    def _many_viewed(self, ads: list[Item]) -> list[bool]:
+        """Пакетная проверка «просмотрено ли» одним SQL-запросом."""
+        if not ads:
+            return []
+        records = [self.db_handler.record_from_ad(ad) for ad in ads]
+        existing = self.db_handler.existing_records(records)
+        return [record in existing for record in records]
 
 
     def get_proxy_obj(self) -> Proxy | None:
@@ -92,10 +109,6 @@ class AvitoParse:
     def _api_url_for_page(api_url: str, page: int) -> str:
         parts = urlsplit(api_url)
         query = parse_qsl(parts.query, keep_blank_values=True)
-        page_key = next(
-            (key for key, _ in query if key in {"p", "page"}),
-            "p",
-        )
         query = [(key, value) for key, value in query if key not in {"p", "page"}]
         query.append(("page", str(page)))
         return urlunsplit(
@@ -141,21 +154,17 @@ class AvitoParse:
         if not self.config.one_file_for_link:
             self.result_storage = build_result_storage(config=self.config)
 
-        api_urls = {}
-        for source_url in self.config.urls:
+        for link_index, source_url in enumerate(self.config.urls):
             if self.stop_event and self.stop_event.is_set():
                 return
+
             try:
-                api_urls[source_url] = self.url_converter.convert(source_url)
+                api_url = self.url_converter.convert(source_url)
             except Exception as err:
                 logger.error(
                     f"Не удалось преобразовать ссылку Avito в API URL "
                     f"{source_url}: {err}"
                 )
-
-        for link_index, source_url in enumerate(self.config.urls):
-            api_url = api_urls.get(source_url)
-            if not api_url:
                 continue
 
             if self.config.one_file_for_link:
@@ -174,10 +183,9 @@ class AvitoParse:
                 if not json_data:
                     logger.warning(
                         f"Не удалось получить данные API для {source_url}, "
-                        f"повтор через {self.config.pause_between_links} сек."
+                        f"страница {page}. Повтор в следующем цикле."
                     )
-                    time.sleep(self.config.pause_between_links)
-                    continue
+                    break
 
                 catalog = self._extract_api_catalog(json_data)
                 try:
@@ -200,7 +208,13 @@ class AvitoParse:
                     break
 
                 filtered_ads = self.filter_ads(ads=ads)
-                self.notifier.notify_many(ads=filtered_ads)
+                delivered_ads = self.notifier.notify_many(ads=filtered_ads)
+                if len(delivered_ads) < len(filtered_ads):
+                    logger.warning(
+                        f"Доставлено {len(delivered_ads)} из "
+                        f"{len(filtered_ads)} уведомлений; "
+                        f"недоставленные будут повторены в следующем цикле"
+                    )
                 filtered_ads = self.parse_views(ads=filtered_ads)
                 filtered_ads = self.parse_description(ads=filtered_ads)
                 filtered_ads = self.parse_phone(ads=filtered_ads)
@@ -208,11 +222,15 @@ class AvitoParse:
                 if filtered_ads:
                     logger.info(f"Сохраняю {len(filtered_ads)} объявлений")
                     self.result_storage.save(filtered_ads)
-                    self.__save_viewed(ads=filtered_ads)
+                    if delivered_ads:
+                        self.__save_viewed(ads=delivered_ads)
                     ads_in_link.extend(filtered_ads)
 
-                logger.info(f"Пауза {self.config.pause_between_links} сек.")
-                time.sleep(self.config.pause_between_links)
+                has_more_pages = page < self.config.count
+                has_more_links = link_index < len(self.config.urls) - 1
+                if has_more_pages or has_more_links:
+                    logger.info(f"Пауза {self.config.pause_between_links} сек.")
+                    interruptible_sleep(self.config.pause_between_links, self.stop_event)
 
             if ads_in_link:
                 logger.info(
@@ -242,8 +260,6 @@ class AvitoParse:
         html_code = BeautifulSoup(html_code, "html.parser")
         try:
             for _script in html_code.select('script'):
-
-                script_type = _script.get('type')
 
                 if data_type == 'mime':
                     for script in html_code.select('script'):
@@ -364,7 +380,11 @@ class AvitoParse:
             except Exception as err:
                 logger.warning(f"Ошибка при разборе карточки {ad.id}: {err}")
                 continue
-            time.sleep(random.uniform(0.1, 0.9))
+
+            # Живоподобная пауза между карточками; после последней не нужна,
+            # а при активном регуляторе темпа пауза уже добавлена им
+            if index < total_ads and GOVERNOR.penalty <= 0:
+                time.sleep(random.uniform(0.1, 0.9))
         return ads
 
     def parse_views(self, ads: list[Item]) -> list[Item]:

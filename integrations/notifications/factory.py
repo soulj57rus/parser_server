@@ -18,7 +18,12 @@ def build_notifier(config: AvitoConfig) -> Notifier:
 
     if config.vk_token:
         for _user_id in config.vk_user_id:
-            notifiers.append(VKNotifier(vk_token=config.vk_token, user_id=_user_id))
+            notifiers.append(VKNotifier(
+                vk_token=config.vk_token,
+                user_id=_user_id,
+                proxy=config.vk_proxy,
+                only_text=config.vk_only_text,
+            ))
 
     if notifiers:
         return CompositeNotifier(notifiers)

@@ -1,8 +1,10 @@
 [avito]
 tg_token = ""
 tg_chat_id = []
-vk_token = "vk1.a.tqG2wtnaXk2LTLjbVrTqTeBSPDr0sSfm6IAl-TMnLISEvOJaui8aKy7qeQfqq5vCJLqV93lSIGtknIw37vMLyNOH_8iDFEkHw9VNFCsY3M5kuzv-fscNdsRAKP2IkqMz3Kb8aDCLrQJph99OHHwkUIj83wlLrvHNhl6warSd4QeghaWK5bXdNiZMCX-YstWiVwiVkDnGBZy33kP2Crn1yQ"
-vk_user_id = ["700997804"]
+vk_token = ""
+vk_user_id = []
+vk_proxy = ""
+vk_only_text = false
 urls = [
     "https://m.avito.ru/all/audio_i_video?context=H4sIAAAAAAAA_wE8AMP_YToyOntzOjg6ImZyb21QYWdlIjtzOjY6ImlubGluZSI7czoxNDoiaGFzRXh0cmFQYXJhbXMiO2I6MTt9bRCyeTwAAAA&geoCoords=55.755814%2C37.617635&presentationType=serp&q=умная%20колонка&radius=0&s=104",
     "https://www.avito.ru/all?cd=1&q=колонка+алиса&s=104",

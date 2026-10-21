@@ -10,7 +10,15 @@ def normalize_text(text: str) -> str:
 
 def escape_markdown_v2(text: str) -> str:
     text = normalize_text(text)
-    return re.sub(r'([_\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
+    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!\\])', r'\\\1', text)
+
+
+def build_proxies(proxy: str | None) -> dict | None:
+    """Прокси для requests: 'host:port' или 'scheme://host:port'."""
+    if not proxy:
+        return None
+    value = proxy if "://" in proxy else f"http://{proxy}"
+    return {"http": value, "https": value}
 
 
 def get_price(ad: Item) -> str:

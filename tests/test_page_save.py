@@ -26,6 +26,7 @@ def _make_parser(count=2):
     parser.url_converter.convert.return_value = "https://m.avito.ru/api/9/items"
     parser.db_handler = MagicMock()
     parser.notifier = MagicMock()
+    parser.notifier.notify_many.side_effect = lambda ads: list(ads)
     parser.ads_filter = MagicMock()
     parser.filter_ads = lambda ads: ads
     parser.parse_views = lambda ads: ads
