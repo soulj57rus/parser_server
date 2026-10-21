@@ -6,6 +6,7 @@ from typing import Optional
 from loguru import logger
 
 from parser.cookies.base import CookiesProvider
+from utils.pacing import interruptible_sleep
 
 
 class OwnCookiesProvider(CookiesProvider):
@@ -14,8 +15,10 @@ class OwnCookiesProvider(CookiesProvider):
             storage_path: str | Path = "storage/own_cookies.json",
             save_on_update: bool = True,  # Сохранять при каждом обновлении
             save_on_exit: bool = True,  # Сохранять при выходе (через atexit)
+            stop_event=None,
     ):
         self.storage_path = Path(storage_path)
+        self.stop_event = stop_event
 
         self.last_id: str | None = None  # Может пригодиться для совместимости
         self.last_cookies: dict | None = None
@@ -83,7 +86,7 @@ class OwnCookiesProvider(CookiesProvider):
         Ничего кроме логирования и паузы не делаем при блокировке
         """
         logger.warning("🚫 Блокировка с собственными cookies, ожидаем...")
-        time.sleep(self.UNBLOCK_TIMEOUT)
+        interruptible_sleep(self.UNBLOCK_TIMEOUT, self.stop_event)
 
     @staticmethod
     def _extract_cookies_from_response(response) -> Optional[dict]:

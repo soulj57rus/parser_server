@@ -2,12 +2,10 @@ from parser.cookies.base import CookiesProvider
 from parser.cookies.external_api import ExternalApiCookiesProvider
 from parser.cookies.own_cookies import OwnCookiesProvider
 
-def build_cookies_provider(config, proxy=None) -> CookiesProvider | None:
+def build_cookies_provider(config, proxy=None, stop_event=None) -> CookiesProvider | None:
     if config.use_bypass_api:
-        return ExternalApiCookiesProvider(config, proxy=proxy)
+        return ExternalApiCookiesProvider(config, proxy=proxy, stop_event=stop_event)
     elif config.use_own_cookies:
-        return OwnCookiesProvider()
+        return OwnCookiesProvider(stop_event=stop_event)
 
     return None
-
-
